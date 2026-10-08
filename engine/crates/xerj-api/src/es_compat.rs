@@ -22514,8 +22514,10 @@ pub async fn delete_index_template(
 
 /// An index's `index.max_result_window`, in any of the three spellings a
 /// settings document can carry it (nested `index.max_result_window`, a flat
-/// dotted key under `index`, or a top-level dotted key), defaulting to ES's
-/// 10,000. Shared by the `ids` clause check and the `rerank.window` check.
+/// dotted key under `index`, or a top-level dotted key), defaulting to the
+/// node's `limits.max_result_window` (10,000 by default, the ES default) like
+/// the engine's own check. Shared by the `ids` clause check and the
+/// `rerank.window` check.
 fn index_max_result_window(state: &AppState, ix: &str) -> usize {
     state
         .engine
@@ -22537,7 +22539,7 @@ fn index_max_result_window(state: &AppState, ix: &str) -> usize {
                 .or_else(|| s.get("index.max_result_window").and_then(as_int))
         })
         .map(|v| v as usize)
-        .unwrap_or(10_000)
+        .unwrap_or(state.engine.config().limits.max_result_window)
 }
 
 #[derive(Debug, Deserialize, Default)]
