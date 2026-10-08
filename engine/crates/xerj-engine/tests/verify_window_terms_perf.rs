@@ -81,9 +81,12 @@ async fn seed(idx: &std::sync::Arc<Index>) -> Vec<String> {
     for g in 0..GROUPS {
         digests.push(format!("axf2-{:032x}-{:04x}", g * 7, g));
         for r in 0..DOCS_PER_GROUP {
-            idx.index_document(Some(format!("doc-{}", g * DOCS_PER_GROUP + r)), doc_body(g, r))
-                .await
-                .unwrap();
+            idx.index_document(
+                Some(format!("doc-{}", g * DOCS_PER_GROUP + r)),
+                doc_body(g, r),
+            )
+            .await
+            .unwrap();
         }
     }
     idx.flush().await.unwrap();
@@ -221,8 +224,7 @@ async fn count_lane_with_resident_ghosts_is_served_and_exact() {
         "deleted rows must leave their bucket"
     );
     assert_eq!(
-        counts[&digests[1]],
-        DOCS_PER_GROUP as u64,
+        counts[&digests[1]], DOCS_PER_GROUP as u64,
         "byte-identical rewrites: ghost out, memtable copy in — net zero"
     );
     for (d, c) in &counts {
@@ -301,7 +303,9 @@ async fn doc_lane_window_fetch_is_bounded() {
         } else {
             run_other_ids.push(format!("cat-{i}"));
         }
-        idx.index_document(Some(format!("cat-{i}")), doc).await.unwrap();
+        idx.index_document(Some(format!("cat-{i}")), doc)
+            .await
+            .unwrap();
     }
     idx.flush().await.unwrap();
 
