@@ -267,6 +267,12 @@ impl Config {
             return Err(XerjError::config("embedding.timeout_ms must be at least 1"));
         }
 
+        if !(1..=i32::MAX as usize).contains(&self.limits.max_result_window) {
+            return Err(XerjError::config(
+                "limits.max_result_window must be in 1..=2147483647",
+            ));
+        }
+
         if !(1..=4096).contains(&self.embedding.onnx_scheduling_window) {
             return Err(XerjError::config(
                 "embedding.onnx_scheduling_window must be in 1..=4096",
@@ -1688,10 +1694,11 @@ pub struct LimitsConfig {
     pub max_body_bytes: usize,
     /// Maximum value of `from + size` in a search request (default: `10_000`).
     ///
-    /// Mirrors Elasticsearch's `index.max_result_window`. Deep pagination past
-    /// this should use `search_after` / point-in-time cursors instead. The
-    /// limit prevents `size=2_000_000_000` from allocating 2 billion `Hit`
-    /// structs from a single HTTP POST.
+    /// The node-wide default for Elasticsearch's `index.max_result_window`:
+    /// an index whose settings carry `index.max_result_window` uses that, any
+    /// other index uses this. Deep pagination past it should use
+    /// `search_after` / point-in-time cursors instead. Must be in
+    /// `1..=2147483647` (the setting's ES range).
     pub max_result_window: usize,
     /// Maximum number of doc-references in a single `_mget` request body
     /// (default: `10_000`). Mirrors `max_result_window`.
@@ -2826,6 +2833,14 @@ mod tests {
         let cfg = Config::from_toml_str("[embedding]\ntimeout_ms = 900\n")
             .expect("a sub-second timeout is a valid timeout");
         assert_eq!(cfg.embedding.timeout_ms, 900);
+    }
+
+    #[test]
+    fn max_result_window_must_be_a_positive_es_int() {
+        assert!(Config::from_toml_str("[limits]\nmax_result_window = 0\n").is_err());
+        assert!(Config::from_toml_str("[limits]\nmax_result_window = 2147483648\n").is_err());
+        let cfg = Config::from_toml_str("[limits]\nmax_result_window = 50000\n").unwrap();
+        assert_eq!(cfg.limits.max_result_window, 50_000);
     }
 
     #[test]
