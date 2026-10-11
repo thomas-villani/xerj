@@ -39,9 +39,14 @@ use crate::sort::{SortField, SortMissing, SortMode, SortOrder};
 // workers each get their own counter.
 const MAX_QUERY_DEPTH: usize = 64;
 
-/// Cap on `from + size`. Mirrors ES's `index.max_result_window` default.
-/// Deep pagination beyond this should use `search_after`/PIT instead.
-pub const MAX_RESULT_WINDOW: usize = 10_000;
+/// Parse-time ceiling on `from + size`: the largest value ES's
+/// `index.max_result_window` can take (a Java `int`). The real limit is the
+/// index's `index.max_result_window`, else the node's
+/// `limits.max_result_window` (default 10,000), and the engine enforces it
+/// before anything is materialised. This bound only keeps the arithmetic
+/// sane; it used to be a hardcoded 10,000, which silently overrode a larger
+/// per-index setting. Deep pagination should use `search_after`/PIT.
+pub const MAX_RESULT_WINDOW: usize = i32::MAX as usize;
 
 // ── Boolean clause limit ──────────────────────────────────────────────────────
 //
@@ -262,10 +267,9 @@ pub fn parse_request(body: &Value) -> Result<SearchRequest> {
         None => 10,
     };
 
-    // ES default `index.max_result_window` is 10_000. Without this cap a
-    // single request with `size=2_000_000_000` allocates a Vec<Hit> for two
-    // billion entries before pagination. Trust the user the same way ES
-    // does — i.e., not at all.
+    // The per-index / per-node window is checked by the engine (it needs the
+    // index settings, which the parser does not have), ahead of every
+    // allocation sized by `from + size`; see `MAX_RESULT_WINDOW`.
     if from.saturating_add(size) > MAX_RESULT_WINDOW {
         return invalid(format!(
             "from + size must be <= {MAX_RESULT_WINDOW} (got {})",
@@ -4796,6 +4800,17 @@ mod tests {
 
     fn q(j: serde_json::Value) -> QueryNode {
         parse_query(&j).expect("parse failed")
+    }
+
+    /// The window is the engine's to enforce (per-index setting, then the node
+    /// limit); the parser only bounds the arithmetic at the setting's largest
+    /// value. A hardcoded 10,000 here overruled `index.max_result_window`.
+    #[test]
+    fn parser_leaves_the_result_window_to_the_index() {
+        let r = parse_request(&json!({ "from": 20_000, "size": 10 }))
+            .expect("from 20,000 is legal for an index whose window allows it");
+        assert_eq!((r.from, r.size), (20_000, 10));
+        assert!(parse_request(&json!({ "from": i32::MAX as u64, "size": 1 })).is_err());
     }
 
     // ── #846: minimum_should_match negative / combination specs ───────────────
