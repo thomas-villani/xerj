@@ -2,27 +2,71 @@
 
 This roadmap tracks capabilities that are **planned but not yet fully implemented**, so the project's public claims stay honest about what ships today versus what is coming. Status is verified against the actual code and by real API requests to the release binary, not aspirational.
 
-Last reviewed: 2026-10-07 (against `v1.0.0-rc.89` and `main`). Statuses trace to issues, merged PRs, the CHANGELOG, and the conformance suite; items carried forward from the 2026-07-12 review without fresh live verification are marked as such. This review line is machine-checked: `docs_capability_lists` fails the build if a release is cut without re-reviewing this file (issue #298 — closed as abandoned 2026-09-29; the machine check, not the issue, enforces the cadence now). This pass is the rc.89 release-cut roll:
+Last reviewed: 2026-10-08 (against `v1.0.0-rc.93` and `main`). Statuses trace to issues, merged PRs, the CHANGELOG, and the conformance suite; items carried forward from the 2026-07-12 review without fresh live verification are marked as such. This review line is machine-checked: `docs_capability_lists` fails the build if a release is cut without re-reviewing this file (issue #298 — closed as abandoned 2026-09-29; the machine check, not the issue, enforces the cadence now). This pass is the rc.93 release-cut roll:
 the open-defects shortlist was re-verified against the live tracker at
-cut time — **eleven open**. Two were missing from the rc.88 roll and
-are added now, both filed inside its window: #1212 (scans silently
-truncating when a merge or flush publishes mid-walk — the engine half
-is fixed in this release by PR
-[#1218](https://github.com/xerj-org/xerj/pull/1218) and both client
-legs by [#1213](https://github.com/xerj-org/xerj/pull/1213)/[#1216](https://github.com/xerj-org/xerj/pull/1216); the issue stays open until
-the standing xerj-search rebuild completes against the released fix)
-and #1220 (the kNN exact scan's admission predicate still reading the
-live version map — a pre-existing predicate the #1217 review surfaced
-and filed). #1091's latency half is fixed in this release by PR
-[#1217](https://github.com/xerj-org/xerj/pull/1217) (FiQA, lexical
-embedder: semantic p50 3,865→261 ms, hybrid 5,772→289 ms, watermark
-crossings 25→0, answers bit-identical); the issue stays open for the
-neural-embedder re-measurement under the original 13-26 s conditions.
-One rc.89-window issue closed verified: #1214 (corpus index silently
-running legacy mode over a recorded build, PR
-[#1215](https://github.com/xerj-org/xerj/pull/1215)). The remaining
-shortlist is unchanged from the rc.88 cut (#1094, #1100, #1122, #1170,
-#1173, #1108, #1110, #1183).
+cut time — **twelve open**, the ten carried from rc.92 (#1094, #1100,
+#1122, #1170, #1173, #1108, #1110, #1183, #1212, #1226) plus #1250 and
+#1267, the slow-query population filed inside this window. #1260 was
+filed and closed inside the window (PR
+[#1262](https://github.com/xerj-org/xerj/pull/1262)): the per-digest
+`bool.filter [term ax_file, exists]` probe fell off the columnar fast
+path — `exists` had no compiler arm and the deletes bail keyed on a
+monotonic ghost counter so a rewritten index never re-qualified — and
+measured 3.4 s → 2.7 ms warm (~1,250×) on the restarted crawl node.
+#1267 carries what #1260 did not reach: the finalize-catalog read-back
+walk (`term run_id` + `_id` sort, 641 pages ≈ 35 min whenever a resume
+rewrote the whole catalog) and the doc-lane residual — verify windows
+with `size > 0` still brute-scan, 7–81 s per data index, and one
+exceeded the client's 300 s request budget on the cve resume. The
+#1183 count lane landed twice in this window:
+[#1259](https://github.com/xerj-org/xerj/pull/1259) batched the verify
+read-backs (~1.2 M serial searches → ~800 windows; record windows
+63 ms cold / 6 ms warm) and
+[#1262](https://github.com/xerj-org/xerj/pull/1262) columnarized
+`exists`; the vuln-fix-commits rebuild completed on it (328,891
+records, 97 batched windows verified) and its pre-registered G7 graded
+4/5 PASS, so #1244's completion condition now rides the cve-records
+rebuild alone, in flight at cut time. The rc.92 cut's record stands as
+written: twelve open at that cut — with the correction that #1254 was
+closed by that window's own
+[#1258](https://github.com/xerj-org/xerj/pull/1258) merge (the
+auto-close fired at 655ea93ec, 42 minutes before the tag; the cut's
+"stays open" note predates the close), so its `code_files=0` labeling
+remainder is not an open tracker. #1250 (multi-index ingest oscillating on the memory
+breaker) had its attribution corrected the same day it was filed: the
+rejecting breaker is the boot-time tiered process cap (95% watermark),
+not the live-settable `max_query_memory_mb`, and the mitigation is the
+`XERJ_MAX_PROCESS_MEMORY_MB` restart; the same cap was then measured
+driving an *idle* flush loop — two parked A/B nodes wrote 644 GB and
+858 GB to disk in seven hours with no client traffic. #1254
+(re-attributed twice in one day, each time by measurement): the original
+"silently unindexed" claim was retracted first (its probe wildcarded
+`ax_file`, which stores content digests, not filenames — `ax_path`
+shows all 79 `.proto` records present), then the txt-lines
+chunk-splitting mechanism was retracted too (a simulated whole-document
+route ranked the needle 25th, worse than the real chunks' 19th — length
+dilution beats mass concentration). The single effective variable is the
+`text^0.5` recall-leg weight, the #1238 calibration, which discounts
+exactly the family a text-primary corpus lives on; the corpus-declared
+`query.text_weight` fix ([#1258](https://github.com/xerj-org/xerj/pull/1258))
+moved all four G7 needles to rank 1 on the unchanged index and the
+suite re-graded 5/5. The issue **stays open** for the minor
+`code_files=0` labeling gap in the index terminal line. #1244 **stays open** with both mechanism fixes merged
+inside the window ([#1246](https://github.com/xerj-org/xerj/pull/1246),
+[#1251](https://github.com/xerj-org/xerj/pull/1251)): its completion
+condition is the pre-registered G7 suites passing on rebuilt corpora,
+and both rebuilds (cve-records, vuln-fix-commits) were in flight at cut
+time. The rc.91 cut's record stands as written: ten open at that cut,
+one closed verified inside the window (#1238, PR
+[#1241](https://github.com/xerj-org/xerj/pull/1241)). #1183 keeps its
+measured mechanism (the 2026-10-08 comment table: finalize-verify pays
+1.2 s bare / ~14 s term+exists per uncached `ax_file` value on the
+572,992-doc index; the scored lane was fixed by rc.91's
+[#1234](https://github.com/xerj-org/xerj/pull/1234), and this window's
+[#1259](https://github.com/xerj-org/xerj/pull/1259) +
+[#1262](https://github.com/xerj-org/xerj/pull/1262) landed the count
+lane) and its completion condition: a full xerj-search
+rebuild passing finalize with verified numbers.
 **Two closed inside the rc.87 window and recorded in the CHANGELOG, not
 carried here:** #1147 (the build-throughput class, PR
 [#1195](https://github.com/xerj-org/xerj/pull/1195), merged just past
@@ -217,13 +261,26 @@ and the console review's), the #1062 wrong-and-confident detection gate, the
 `xerj-decide-v1` Hugging Face publication (operator credentials), and the GA
 bar itself — *The road to v1.0.0 GA* below.
 
-**Open defects.** Eleven, all live on the tracker — the
-shortlist the release-notes gate checks. From the rc.80 gate runs:
-[#1091](https://github.com/xerj-org/xerj/issues/1091) (hybrid first stage
-13–26 s/query on the 57,638-doc FiQA index; the latency half fixed in
-rc.89 by PR [#1217](https://github.com/xerj-org/xerj/pull/1217) — semantic
-p50 3,865→261 ms — with the original `--embed-mode neural` conditions not
-yet re-measured) and
+**Open defects.** Twelve, all live on the tracker — the
+shortlist the release-notes gate checks. From the rc.92 window:
+[#1250](https://github.com/xerj-org/xerj/issues/1250) (multi-index
+ingest oscillates on the parent RSS breaker; root cause re-attributed
+same-day to the boot-time tiered process cap, mitigation the
+`XERJ_MAX_PROCESS_MEMORY_MB` restart, and the same cap drives an idle
+flush loop measured at 644/858 GB of writes) and
+[#1267](https://github.com/xerj-org/xerj/issues/1267) (the finalize
+slow-query residual after #1260: the catalog_generation read-back walk
+brute-pages `term run_id` + `_id` sort at ~5.2 s per 1,000-doc page —
+641 pages ≈ 35 min on the 402,814-doc catalog whenever a resume
+rewrote everything — and doc-shaped verify windows with `size > 0`
+still brute-scan the data indexes at 7–81 s per window, one exceeding
+the client's 300 s budget mid-crawl).
+[#1244](https://github.com/xerj-org/xerj/issues/1244) (the `xerj code`
+own-field recall legs and the multi-family family-route gate both
+merged in rc.92; the issue stays open until the pre-registered G7
+suites pass on the rebuilt corpora — vuln-fix-commits passed at cut
+time: 328,891 records, 97 batched windows, G7 blind-graded 4/5; the
+cve-records rebuild was in flight). From the rc.80 gate runs:
 [#1094](https://github.com/xerj-org/xerj/issues/1094) (decision
 flywheel write-back freezes once the history index has BM25 support).
 From the rc.80 console knowledge-surface review:
@@ -255,10 +312,39 @@ truncating when a merge or flush publishes mid-walk: the engine fix is
 [#1218](https://github.com/xerj-org/xerj/pull/1218), the client legs
 [#1213](https://github.com/xerj-org/xerj/pull/1213)/[#1216](https://github.com/xerj-org/xerj/pull/1216), all in rc.89; resume3 of the
 standing rebuild aborted on exactly this short read-back, and the issue
-closes only when a rebuild completes against the released fix) and
-[#1220](https://github.com/xerj-org/xerj/issues/1220) (the kNN exact
-scan's admission predicate reads the live version map — pre-existing,
-window ~15× narrower after #1217, capture-scoping filed as the follow-up).
+closes only when a rebuild completes against the released fix) and, from
+the rc.90 window,
+[#1226](https://github.com/xerj-org/xerj/issues/1226) (`_refresh` /
+`delete_by_query?refresh=true` costs 5–16 s under concurrent bulk write
+load — mostly reframed by #1227: those latencies were the unconditional
+no-match flush that #1225 and #1227 removed the callers of; what stays
+open is the flush itself under concurrent bulk load, measured 14–16 s on
+the corpus-builder node).
+**Closed inside the rc.93 window and recorded in the CHANGELOG, not
+carried here:** #1260 (per-digest `exists` probes fell off the
+columnar fast path: columnar `exists` + per-segment ghost-bitmap
+admission, 3.4 s → 2.7 ms warm on the live crawl node, PR
+[#1262](https://github.com/xerj-org/xerj/pull/1262)) and #1254 (closed
+by the rc.92 window's own #1258 merge — the auto-close fired at
+655ea93ec, 42 minutes before the rc.92 tag; the rc.92 roll's "stays
+open" note predates the close, so it is de-linked here).
+**Closed inside the rc.91 window and recorded in the CHANGELOG, not
+carried here:** #1238 (one sibling repo could fill a whole `xerj code`
+page — every hit a different file, so the #1137 per-file cap could not
+see the wall — and the plain-text extraction family could outscore
+code-family hits; the per-index cap and the `text^0.5` recall leg, PR
+[#1241](https://github.com/xerj-org/xerj/pull/1241)).
+**Closed inside the rc.90 window and recorded in the CHANGELOG, not
+carried here:** #1220 (the kNN exact scan's capture bracket and
+capture-scoped admission, PR
+[#1223](https://github.com/xerj-org/xerj/pull/1223)), #1222 (a no-match
+by-query run no longer flushes, PR
+[#1227](https://github.com/xerj-org/xerj/pull/1227)) and #1091 (hybrid
+first-stage latency on FiQA; the latency half fixed in rc.89 by PR
+[#1217](https://github.com/xerj-org/xerj/pull/1217) — semantic p50
+3,865→261 ms — and closed by the #1219 field report that documented the
+session; the `--embed-mode neural` re-measure it flagged is recorded
+here, not left as a silent condition).
 **Closed inside the rc.86 window and recorded in the CHANGELOG, not
 carried here:** #1109, #1189, #1190, #1186, #1146 and #1092 (PRs
 [#1194](https://github.com/xerj-org/xerj/pull/1194),
