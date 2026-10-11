@@ -2173,6 +2173,9 @@ fn parse_qs_unary(
             let scoped = QsFields {
                 default_field: Some(&field),
                 fields: &[],
+                // Leniency is decided once per `query_string`, not per clause
+                // (#1284), so a `field:( … )` group inherits the parent's flag.
+                lenient: ctx.lenient,
             };
             parse_qs_unary(toks, pos, scoped, default_op)
         }
