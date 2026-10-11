@@ -7030,6 +7030,7 @@ fn parse_highlight(hl_val: &Value) -> Option<xerj_query::ast::HighlightRequest> 
             .get("number_of_fragments")
             .and_then(Value::as_u64)
             .map(|n| n as usize),
+        require_field_match: obj.get("require_field_match").and_then(Value::as_bool),
     })
 }
 
@@ -25516,6 +25517,9 @@ async fn msearch_impl(
     body: bytes::Bytes,
     default_index: Option<String>,
 ) -> axum::response::Response {
+    // Envelope `took` (#1288): ES 8.x reports the wall time of the whole
+    // multi-search next to `responses`, as `msearch_template_impl` does.
+    let msearch_started = Instant::now();
     let text = match std::str::from_utf8(&body) {
         Ok(t) => t,
         Err(_) => {
@@ -25914,7 +25918,11 @@ async fn msearch_impl(
         responses.push(resp);
     }
 
-    Json(json!({ "responses": responses })).into_response()
+    Json(json!({
+        "took": msearch_started.elapsed().as_millis() as u64,
+        "responses": responses,
+    }))
+    .into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
