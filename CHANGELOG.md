@@ -7,6 +7,284 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.93] - 2026-10-08
+
+### Fixed
+
+- **The autoindex finalize-verify probe fell off the columnar fast path**
+  (issue [#1260](https://github.com/xerj-org/xerj/issues/1260), PR
+  [#1262](https://github.com/xerj-org/xerj/pull/1262)) — two walls sat between
+  the verify query shape (`bool.filter [terms …, exists <field>]`) and the fast
+  path: `exists` had no arm in the predicate compiler, and the deletes bail
+  keyed on the MONOTONIC `ghost_events` counter, so an index that had ever
+  seen an overwrite — the catalog is rewritten by every finalize-catalog —
+  never re-qualified, even after merges compacted every ghost away. `exists`
+  now compiles to a columnar predicate and admission is per-segment via the
+  ghost-position bitmap: empty bitmaps proceed (live == physical), dirty ones
+  still bail. Measured on the live 402,814-doc autoindex-catalog crawl node:
+  the per-digest probe ran 3.4 s on the pre-fix server and 2.7 ms warm on the
+  fixed one (~1,250×; the first post-restart probe pays an 8.8 s cold page-in,
+  verified to be one-time by a warm repeat). New integration file
+  `fast_aggs_exists_and_deletes.rs`: six tests pinning fast-path/brute
+  agreement across present / JSON-null / absent / empty-string exists shapes,
+  the meta-field bail, the unmerged-ghost bail, merged-history re-qualify,
+  and object-valued memtable docs. The served/bailed assertions read the
+  process-global `FAST_PATH_AGGS_SERVED` counter as a before/after delta, and
+  CI run 37816544794 caught the six tests racing on it — the file now
+  serializes behind one tokio Mutex (the engine half was never implicated:
+  serialized, the meta-field query bails exactly as required).
+
+- **`pack publish` could not survive a same-day rebuild under immutable
+  releases** (PR [#1268](https://github.com/xerj-org/xerj/pull/1268)) — the
+  re-run path deleted today's PUBLISHED pack release and recreated the same
+  tag, but a burned tag can never name another release (run 37826006767 hit
+  the exact 36358399114 error pair and left the day without a published
+  rust-vulns pack; repaired by hand under `-r2`). Both pack jobs now pick the
+  first unused tag (date, then `-r2`, `-r3`, … by release + git-ref probe),
+  retag past an immutable-release refusal instead of failing, and never
+  delete a published release for a rebuild. The retention step also finally
+  works: `gh release list --json` was an unsupported flag, so it had silently
+  matched zero releases since M6 — it now sorts by `created_at` via the API
+  (a `-r2` suffix breaks lexicographic tag order) and includes abandoned
+  drafts.
+
+### Performance
+
+- **The finalize-verify barrier read back one changed group at a time — three
+  serial searches per file** (PR
+  [#1259](https://github.com/xerj-org/xerj/pull/1259), the #1183 count lane)
+  — cve-records projected ~50 h and vuln-fix-commits ~120 h of verify tail
+  against index phases measured in hours. Verify now batches per (index ×
+  1,024 content digests): record windows (terms filter + exact terms
+  aggregation) run 63 ms cold / 6 ms warm on the columnar fast path, the
+  catalog leg `_source`-restricted paged fetch-count runs 31 ms cold / 14 ms
+  warm, delete-aware, with mid-window total changes and count/total
+  mismatches failing loud. ~1.2 M serial searches collapse to ~800 windows
+  for cve-records. Failure messages and the first-disagreement group are
+  unchanged; the progress denominator is now windows, so the line never sits
+  at `0/N` for a walk's duration. `cargo test -p xerj-autoindex --lib`:
+  1299 passed, 0 failed. First live proof: the vuln-fix-commits rebuild
+  completed on this client — 328,891 records, 97 batched windows verified.
+
+### Added
+
+- **`agent-session-trajectories`, the first external-contributor corpus pack**
+  (PRs [#1263](https://github.com/xerj-org/xerj/pull/1263),
+  [#1265](https://github.com/xerj-org/xerj/pull/1265); recipe and stats on
+  corpus-hub in #1255 and #1264) — 70 sanitized multi-session agent
+  trajectories from chunxiaoxx / Nautilus (demand anchored to #1138, wishlist
+  slot #1210), CC-BY-4.0, 70 envelopes → 70 records with failure turns kept
+  verbatim. The pack ships with its own ed25519 keypair: `.pub` committed at
+  `tools/packs/keys/agent-session-trajectories.pub`, the seed as the
+  `PACK_SIGNING_SEED_AST` Actions secret, and a dedicated job in the
+  scheduled `pack publish` workflow — build, sign, consumer-path verify
+  against the committed key, dated immutable release. First release
+  `pack-agent-session-trajectories-2026-10-08` published and consumer-
+  verified from the public release URL (70 records, signature checked against
+  the `raw.githubusercontent.com` key).
+- **`vuln-fix-commits` live on the hub with graded evidence** (corpus-hub PR
+  #1266) — project-kb fix commits: 328,891 records, 97 batched verify windows
+  passed, and the pre-registered G7 suite blind-graded 4/5 PASS (three
+  rank-1 needle hits, one rank-3, one miss where the 2020-era sleuthkit
+  `yaffsfs_istat` payload lost to newer buffer-overflow payloads on generic
+  terms). Graded evidence committed at
+  `tools/xerj-code/hub/backlog/g7-vuln-fix-commits-2026-10-08-graded.json`.
+  The hub stands at 103 manifests / 105 live rows.
+
+## [1.0.0-rc.92] - 2026-10-08
+
+### Fixed
+
+- **A corpus whose records carry prose in schema-named fields was invisible to
+  `xerj code`** (issue
+  [#1244](https://github.com/xerj-org/xerj/issues/1244), PR
+  [#1246](https://github.com/xerj-org/xerj/pull/1246)) — the pre-registered
+  g7-cve-records-2026-10-08 suite measured 0/7 because `resolve_fields` sent
+  only the synthesized `text^0.5`: one shard mapped `text` and its presence
+  kept the own-field fallback from ever firing, while the records' actual prose
+  lived in fields like `containers_cna_descriptions` (rank 1 at 18.76 queried
+  directly). Own text fields now join the `multi_match` as `^0.5` recall legs
+  beside the standard fields — safe because `best_fields` executes as dis_max,
+  so a leg can only win by genuinely outranking the content fields at half
+  weight — gated to fields mapped by at least a quarter of the union's indices.
+  Measured spectrum the gate sits on has an empty middle: schema prose repeats
+  across shards (cve-records 37-96% of 118 indices) while README-frontmatter
+  junk does not (exploit-pocs-2026: 2,143 own text fields, all ≤1% — the old
+  alphabetical 24-cap kept a literal `$comment` and cut `Summary`). The
+  mechanism fix is complete; #1244 itself stays open until the
+  pre-registered G7 suites pass on the rebuilt corpora — the cve-records
+  and vuln-fix-commits rebuilds were in flight at release time.
+
+- **A multi-family corpus still lost its minority family to that same gate**
+  (issue [#1244](https://github.com/xerj-org/xerj/issues/1244), PR
+  [#1251](https://github.com/xerj-org/xerj/pull/1251)) — vuln-fix-commits is
+  project-kb repo source (body/defs/title) beside 29,240 fix-commit payloads
+  whose prose lives in `message`, mapped by 4 of 26 union indices against a
+  gate demanding 7: the corpus answered every query from its tooling files
+  while every payload was unsearchable (the needle was rank 1 at 36.35 queried
+  on `message` directly, zero payload hits through the client). A field now
+  joins when it passes the quarter gate OR any index that maps none of the
+  standard content fields maps it, and the 24-leg cap ranks by mapping coverage
+  instead of name. Exact-signature family grouping was measured and rejected:
+  the mapper types only fields present in a shard's documents, so one family
+  splits into `message,patch,text` and `files,message,text` shards and each
+  half fails its own majority rule. Regression-checked on exploit-pocs-2026
+  (pinned query "MCPJam inspector 23744": needle README still rank 1, POC.py
+  rank 3), whose 689 own-only indices (12% of the corpus) are newly reachable.
+  #1244 stays open for the same completion condition as above: the suite
+  reruns on the rebuilt corpora close it, not this code.
+
+- **A corpus whose primary content rides the plain-text family was invisible
+  to `xerj code`** (issue
+  [#1254](https://github.com/xerj-org/xerj/issues/1254), PR
+  [#1258](https://github.com/xerj-org/xerj/pull/1258)) — the `text^0.5`
+  recall-leg weight is the #1238 calibration for corpora where the text
+  family carries mirror noise beside code-family `body` records, but
+  otel-proto's primary content IS the text family (every `.proto` definition
+  is a txt-lines record), so the discount hid the corpus's point: the
+  pre-registered G7 suite's four proto needles ranked 19/absent/39/23 behind
+  semantic-conventions prose. Two earlier mechanisms were measured and
+  disproven first — absence (a filename wildcard on `ax_file`, which holds
+  content digests; the correct `ax_path` probe shows all 79 records) and
+  txt-lines chunk-splitting (a simulated whole-document route ranked the
+  needle 25th, worse than the real chunks' 19th: length dilution beats mass
+  concentration). A corpus may now declare `query.text_weight` in its
+  `corpus.json` (bounds 0.25..=4.0 enforced; outside them the client warns
+  and keeps the 0.5 default), hub pins carry the block through
+  `corpus add --from`, and the query path applies it to the `text^` slot.
+  Measured on the unchanged index bytes: all four needles 19/absent/39/23 →
+  rank 1, the suite re-grades 5/5 against a ≥3/5 bar, and the no-hint path
+  is byte-identical old vs new binary (diffed on cisa and
+  exploit-pocs-2026). #1254 stays open only for the minor
+  `code_files=0` labeling gap in the index terminal line.
+
+<!-- notes-exempt: #1252 (changelog-only carry of the rc.92 entries; no code,
+     cites the window PRs #1246 and #1251 itself) -->
+
+## [1.0.0-rc.91] - 2026-10-08
+
+### Added
+
+- **The exploit-hub corpus, tested on three post-pin CVEs with and without it** (PR
+  [#1240](https://github.com/xerj-org/xerj/pull/1240)) — the A/B eval write-up the
+  cyber-exploits group was built for: one analyst, two arms (plain Claude Code vs
+  Claude Code + the corpus), three CVEs published after the corpus pin, sealed ground
+  truth. On the needle (CVE-2026-23744, 36 indexed PoC repos) one `multi_match` round
+  over 1,093,749 docs named `POST /api/mcp/connect` and `serverConfig.command` and the
+  one-request trigger, cited — the advisory alone could not; both arms then predicted
+  the wrong patch and that loss stays in the table. On the analogy (CVE-2026-105844,
+  no PoC anywhere) Exploit-DB entry 52528 supplied the denylist segments and both
+  mechanisms the sealed 3.88.0 diff shipped. The empty stratum (CVE-2026-97332) is
+  counted, not dropped. The negative control too: 23 s retrieval vs 2.1 s clone+grep
+  when repo names are already known — the corpus is the discovery layer, not a fetch
+  accelerator. n=3, one analyst: a case study with measured arms, not statistics, and
+  the post says so. The same PR caught live client defect
+  [#1238](https://github.com/xerj-org/xerj/issues/1238) during the eval. Also ships
+  the `xerj-blogposts` house-writing corpus at 8 records (this post included; the
+  registry pin moves with the rebuild in
+  [#1242](https://github.com/xerj-org/xerj/pull/1242)).
+
+### Fixed
+
+- **`exists` inside a filter-context `bool` had no arm in the columnar filter
+  executor, so the whole plan bailed and source-scanned every row** (issue
+  [#1183](https://github.com/xerj-org/xerj/issues/1183), PR
+  [#1234](https://github.com/xerj-org/xerj/pull/1234)) — keyword `exists` lowers to
+  an empty-prefix dictionary range, numeric/boolean to an unbounded window (the same
+  lowerings the standalone root `exists` uses), and text/`semantic_text` fields get a
+  new source-backed `SourceExists` leaf that pays one stored-source parse per term
+  survivor instead of per row. Meta fields stay on the brute path. Measured on the
+  standing node's 91,143-doc segment: the conjunction fell 9,638 ms -> handled by the
+  plan. The finalize-verify crawl itself is larger than this fix: the count-context
+  gate still excludes `SourceExists` plans and a single tombstone disables the
+  term-count fast path, so the exact-semantic-count shape on the 572,992-doc index
+  still brute-scans — measured 2026-10-08 and left tracked in #1183, which stays open
+  until a full xerj-search rebuild passes finalize with verified numbers.
+
+- **One sibling repo could fill a whole `xerj code` page, and the plain-text
+  extraction family could outscore code-family hits** (issue
+  [#1238](https://github.com/xerj-org/xerj/issues/1238), PR
+  [#1241](https://github.com/xerj-org/xerj/pull/1241)) — two diversification fixes
+  in `xccode`. A per-source-INDEX cap (`MAX_PER_INDEX = 1`, engaged only when the
+  fan-out has at least as many distinct indices as the page wants, so a homogeneous
+  corpus's handful of shard indices is untouched): measured on the live exploit group
+  (query "MCPJam inspector 23744", 5,644 indices, 36 needle PoC repos), one
+  sibling-CVE demo repo took 6 of the top 10 slots with a different file each — the
+  per-FILE cap of #1137 cannot see that wall — and the capped page held 5 needle
+  records where the old page held 1. And `text` joins the `multi_match` as a
+  `^0.5` recall leg (same posture as `defs_expanded^0.5`): at full weight one
+  plain-text demo index outscored every code-family hit; at `^0.5` the family stays
+  searchable (same 39 total hits) while needle docs keep their scores.
+
+## [1.0.0-rc.90] - 2026-10-07
+
+### Added
+
+- **A second community contribution from Vinz2168: the agent field report for the #1091
+  diagnosis session** (PR
+  [#1219](https://github.com/xerj-org/xerj/pull/1219)) — one report under
+  `user-feedback/16-agent-field-reports/`, written by the AI coding agent that ran the session
+  and reviewed by its operator, alongside the #1217 fix that session produced (rc.89). Every
+  number in it comes from a command run in that session (the A/B harness and the ES-YAML runner
+  output quoted in #1217). Filing it closed the tracker
+  [#1091](https://github.com/xerj-org/xerj/issues/1091) it diagnoses.
+
+### Fixed
+
+- **The kNN exact scan could silently drop a document it had already captured** (issue
+  [#1220](https://github.com/xerj-org/xerj/issues/1220), PR
+  [#1223](https://github.com/xerj-org/xerj/pull/1223)) — two holes, both fixed. The scan read
+  the memtable and the store snapshot with no generation check between them, so a concurrent
+  flush or merge publication could land mid-capture and the "captured" set was half old
+  generation, half new; and the admission predicate consulted the *live* version map, so a
+  post-capture update of the same id made the captured copy look stale and the scan forgot it.
+  Both walkers now bracket the capture (generation-checked) and admit candidates against the
+  capture-scoped view, not the live one.
+
+- **A no-match `delete_by_query` / `update_by_query` run no longer flushes the index** (issue
+  [#1222](https://github.com/xerj-org/xerj/issues/1222), PR
+  [#1227](https://github.com/xerj-org/xerj/pull/1227)) — by-query runs flushed the member
+  index FIRST, unconditionally, as the #1019 paging precondition; a run whose query matched
+  nothing still paid it. A `size:0` probe through the ordinary search path now runs first and a
+  zero-match returns the zero response without flushing; a matching unflushed doc still counts
+  and takes the flush arm exactly as before. This also corrects the #1222 root cause on
+  record: the idle-flush fingerprint loop was already dead (`Index::flush()` clears the
+  idle-probe pair since #878) — the measured "6,848 one-doc segments for ~3,005 writes" was
+  this unconditional flush firing under the corpus apply loop's per-op defensive deletes.
+  Live A/B on a throwaway node, one doc written with `refresh=false`: old binary, no-match
+  delete → 1-doc segment created; this build → 0 segments, and a matching delete still
+  deletes (`total 1 / deleted 1 / batches 1`).
+
+- **The corpus apply loop asks before deleting: the per-group defensive `delete_by_query` is
+  gated on a visibility probe** (one leg of
+  [#1224](https://github.com/xerj-org/xerj/issues/1224), PR
+  [#1225](https://github.com/xerj-org/xerj/pull/1225)) — every upsert used to fire a
+  defensive `delete_by_query?refresh=true` even when the index held nothing of that content,
+  and one-record-per-file corpora pay one upsert per FILE: cvelistV5's cve-records build is
+  402,744 groups, i.e. 402,744 no-match deletes at a measured 5–16 s each under concurrent
+  bulk load (the forced `refresh=true`), against a `size:0` term probe that answers in <1 ms.
+  The delete now fires only when the probe sees something.
+  #1224 stays open pending the end-to-end re-measure: the O(1) journal fix below removed the
+  measured client-CPU ceiling, and the tracker closes on the completed apply-run numbers, not
+  on the individual legs.
+
+### Performance
+
+- **Corpus apply: O(1) journal state writes and per-replay lookups** (the client-CPU leg of
+  [#1224](https://github.com/xerj-org/xerj/issues/1224), PR
+  [#1228](https://github.com/xerj-org/xerj/pull/1228)) — `Journal::sync_operation_state` ran
+  twice per replayed operation and cloned the entire `PendingSync` (the desired manifest with
+  all 402,695 groups, the 402,744-entry operations Vec, the growing operation_states map) to
+  append one small durable line: ~350 ms × 2 per file, measured on cve-records as apply at
+  **1.18 items/s** with 0.72 s client CPU per file, one core 82% user, RSS 5.7 GB. State
+  writes are now validate → durable append → record in place (the journal line stays the
+  transaction boundary); `PendingSync` carries a lazily-built membership index; the replay
+  path resolves groups and artifacts through a once-per-replay lookup table instead of
+  O(402k) scans. `xerj-autoindex` lib suite 1299 passed / 0 failed; journal failpoint suites
+  unchanged (same events, same order). The after-rate posts on
+  [#1224](https://github.com/xerj-org/xerj/issues/1224) when the in-flight re-measure
+  completes.
+
 ## [1.0.0-rc.89] - 2026-10-07
 
 ### Added
