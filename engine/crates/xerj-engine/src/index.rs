@@ -20203,6 +20203,14 @@ impl Index {
                     ),
                 )));
             }
+            // #1284: a non-numeric value against a numeric field is a query
+            // that cannot be built, and ES fails it (`query_shard_exception` /
+            // `number_format_exception`) rather than answering a 0-hit.
+            if let Some(value) = non_numeric_term_value(&resolved, &schema.schema) {
+                return Err(EngineError::Common(xerj_common::XerjError::invalid_query(
+                    format!("failed to create query: For input string: \"{value}\""),
+                )));
+            }
             // #437: a sort field this engine cannot resolve (any of 11 ES
             // meta-field names besides the ones handled below, or an
             // unmapped/misspelled field) fell through to `_source` lookup
@@ -41272,6 +41280,133 @@ fn unsearchable_query_field(q: &QueryNode, schema: &Schema) -> Option<String> {
     }
 }
 
+/// The first string value a clause sends to a numeric (`long` / `double`)
+/// field that does not parse as a number (#1284).
+///
+/// ES 8.13.4 answers every one of these with a 400 whose root cause reads
+/// `failed to create query: For input string: "abc"`, top-level or under
+/// `bool.filter`; XERJ answered a silent 0-hit 200, so a type error in a
+/// dashboard query looked like an empty result. A decimal against a `long`
+/// (`"1.5"`) is a valid query that matches nothing on ES, so only an
+/// unparseable string is rejected.
+///
+/// `term` / `terms` / `range` have no `lenient` option in ES and are always
+/// checked. The full-text leaves (`match`, `match_phrase`, `multi_match`, and
+/// everything `query_string` / `simple_query_string` lower to, ranges
+/// included) carry the clause's effective `lenient`, which the parser sets.
+/// A lenient leaf is skipped, which is how `query_string` with no
+/// `default_field` keeps answering 200, as on ES. A full-text leaf on a
+/// numeric field takes its whole query string as one value, as ES does
+/// (`match {bytes: "1 2"}` fails on `"1 2"`). A field pattern (`b*`, `*`) is
+/// checked against every numeric field it matches.
+fn non_numeric_term_value(q: &QueryNode, schema: &Schema) -> Option<String> {
+    let numeric = |field: &str| numeric_field_matches(schema, field);
+    let bad_str =
+        |s: &str| -> Option<String> { s.trim().parse::<f64>().is_err().then(|| s.to_string()) };
+    let bad = |v: &serde_json::Value| -> Option<String> { bad_str(v.as_str()?) };
+    // An empty full-text string carries no value to check: the parser makes a
+    // top-level empty `match` a `match_none`, and the only other source is the
+    // `field:` stub of a `field:(…)` group, whose terms are checked as leaves.
+    let bad_text = |s: &str| -> Option<String> {
+        if s.is_empty() {
+            None
+        } else {
+            bad_str(s)
+        }
+    };
+    match q {
+        QueryNode::Term { field, value, .. } if numeric(field) => bad(value),
+        QueryNode::Terms { field, values, .. } if numeric(field) => values.iter().find_map(bad),
+        QueryNode::Range {
+            field,
+            gte,
+            gt,
+            lte,
+            lt,
+            lenient: false,
+            ..
+        } if numeric(field) => [gte, gt, lte, lt].into_iter().flatten().find_map(bad),
+        QueryNode::Match {
+            field,
+            query,
+            lenient: false,
+            ..
+        }
+        | QueryNode::MatchPhrase {
+            field,
+            query,
+            lenient: false,
+            ..
+        } if numeric(field) => bad_text(query),
+        QueryNode::MultiMatch {
+            fields,
+            query,
+            lenient: false,
+            ..
+        } if fields
+            .iter()
+            .any(|f| numeric(f.split('^').next().unwrap_or(f))) =>
+        {
+            bad_text(query)
+        }
+        QueryNode::Bool {
+            must,
+            should,
+            must_not,
+            filter,
+            ..
+        } => must
+            .iter()
+            .chain(should)
+            .chain(must_not)
+            .chain(filter)
+            .find_map(|c| non_numeric_term_value(c, schema)),
+        QueryNode::Constant { query, .. }
+        | QueryNode::Boosted { query, .. }
+        | QueryNode::Named { query, .. }
+        | QueryNode::Nested { query, .. }
+        | QueryNode::FunctionScore { query, .. } => non_numeric_term_value(query, schema),
+        QueryNode::Pinned { organic, .. } => non_numeric_term_value(organic, schema),
+        QueryNode::Boosting {
+            positive, negative, ..
+        } => non_numeric_term_value(positive, schema)
+            .or_else(|| non_numeric_term_value(negative, schema)),
+        QueryNode::DisMax { queries, .. } => queries
+            .iter()
+            .find_map(|c| non_numeric_term_value(c, schema)),
+        QueryNode::Knn { filter, .. } | QueryNode::SemanticSearch { filter, .. } => filter
+            .as_ref()
+            .and_then(|f| non_numeric_term_value(f, schema)),
+        _ => None,
+    }
+}
+
+/// Whether `field` names a numeric (`long` / `double`) field or, for a pattern
+/// containing `*` / `?`, whether any declared numeric field matches it
+/// (#1284). Dotted paths are matched in full, as `multi_match` and
+/// `query_string` expand a `fields` pattern.
+fn numeric_field_matches(schema: &Schema, field: &str) -> bool {
+    fn is_numeric(fc: &FieldConfig) -> bool {
+        matches!(fc.field_type, FieldType::Long | FieldType::Double)
+    }
+    fn any_match(fields: &[FieldConfig], prefix: &str, pattern: &str) -> bool {
+        fields.iter().any(|fc| {
+            let path = if prefix.is_empty() {
+                fc.name.clone()
+            } else {
+                format!("{prefix}.{}", fc.name)
+            };
+            (is_numeric(fc) && crate::engine::glob_match(pattern, &path))
+                || any_match(&fc.fields, &path, pattern)
+        })
+    }
+    if field.contains(['*', '?']) {
+        any_match(&schema.fields, "", field)
+    } else {
+        declared_field(schema, field).is_some_and(is_numeric)
+    }
+}
+
 /// Lower every LEXICAL clause that names a lexically typeless field to
 /// `QueryNode::MatchNone` — the query half of #328.
 ///
@@ -41447,6 +41582,7 @@ fn lower_lexically_typeless_clauses(
             boost,
             slop,
             max_expansions,
+            lenient,
         } => match prune_specs(fields) {
             None => q.clone(),
             Some(kept) if kept.is_empty() => QueryNode::MatchNone,
@@ -41459,6 +41595,7 @@ fn lower_lexically_typeless_clauses(
                 boost: *boost,
                 slop: *slop,
                 max_expansions: *max_expansions,
+                lenient: *lenient,
             },
         },
         QueryNode::SimpleQueryString { query, fields } => match prune_specs(fields) {
@@ -41832,6 +41969,7 @@ mod lexically_typeless_lowering_tests {
                 lte: Some(Value::from(2.0)),
                 lt: None,
                 boost: None,
+                lenient: false,
             },
             QueryNode::Prefix {
                 field: "emb".into(),
@@ -41853,6 +41991,7 @@ mod lexically_typeless_lowering_tests {
                 analyzer: None,
                 boost: None,
                 minimum_should_match: None,
+                lenient: false,
             },
             term("emb_chunks", "0.5"),
         ] {
@@ -41936,6 +42075,7 @@ mod lexically_typeless_lowering_tests {
             boost: None,
             slop: 0,
             max_expansions: 50,
+            lenient: false,
         };
         match lower(&q) {
             QueryNode::MultiMatch { fields, .. } => {
@@ -41961,6 +42101,7 @@ mod lexically_typeless_lowering_tests {
             boost: None,
             slop: 0,
             max_expansions: 50,
+            lenient: false,
         };
         assert!(lower(&q).is_match_none());
     }
@@ -41978,6 +42119,7 @@ mod lexically_typeless_lowering_tests {
             boost: None,
             slop: 0,
             max_expansions: 50,
+            lenient: false,
         };
         assert_eq!(lower(&q), q);
     }
@@ -42586,6 +42728,7 @@ mod keyword_rewrite_filter_tests {
             analyzer: None,
             boost: None,
             minimum_should_match: None,
+            lenient: false,
         }
     }
 
@@ -42677,6 +42820,7 @@ mod keyword_rewrite_filter_tests {
                 analyzer: None,
                 boost: None,
                 minimum_should_match: None,
+                lenient: false,
             })),
             boost: None,
             similarity: None,
@@ -42728,6 +42872,7 @@ mod keyword_rewrite_filter_tests {
                     analyzer: None,
                     boost: None,
                     minimum_should_match: None,
+                    lenient: false,
                 },
                 query_weight: 1.0,
                 rescore_query_weight: 1.0,
@@ -42893,6 +43038,7 @@ fn rewrite_query_aliases(q: &QueryNode, schema: &Schema) -> QueryNode {
                             lte: Some(Value::String(hi)),
                             lt: None,
                             boost: *boost,
+                            lenient: false,
                         };
                     }
                 }
@@ -42930,6 +43076,7 @@ fn rewrite_query_aliases(q: &QueryNode, schema: &Schema) -> QueryNode {
                         lte: Some(epoch),
                         lt: None,
                         boost: *boost,
+                        lenient: false,
                     };
                 }
             }
@@ -43001,6 +43148,7 @@ fn rewrite_query_aliases(q: &QueryNode, schema: &Schema) -> QueryNode {
                                     lte: Some(epoch),
                                     lt: None,
                                     boost: *boost,
+                                    lenient: false,
                                 }
                             })
                         }
@@ -43015,6 +43163,7 @@ fn rewrite_query_aliases(q: &QueryNode, schema: &Schema) -> QueryNode {
                                 lte: Some(Value::String(hi)),
                                 lt: None,
                                 boost: *boost,
+                                lenient: false,
                             })
                     };
                     match rewritten {
@@ -43052,6 +43201,7 @@ fn rewrite_query_aliases(q: &QueryNode, schema: &Schema) -> QueryNode {
             lte,
             lt,
             boost,
+            lenient,
         } => {
             let resolved = resolve_field_alias(schema, field);
             QueryNode::Range {
@@ -43061,6 +43211,7 @@ fn rewrite_query_aliases(q: &QueryNode, schema: &Schema) -> QueryNode {
                 lte: lte.clone(),
                 lt: lt.clone(),
                 boost: *boost,
+                lenient: *lenient,
             }
         }
         QueryNode::Exists { field } => {
@@ -43074,6 +43225,7 @@ fn rewrite_query_aliases(q: &QueryNode, schema: &Schema) -> QueryNode {
             operator,
             analyzer,
             minimum_should_match,
+            lenient,
         } => {
             let resolved = resolve_field_alias(schema, field);
             QueryNode::Match {
@@ -43083,6 +43235,7 @@ fn rewrite_query_aliases(q: &QueryNode, schema: &Schema) -> QueryNode {
                 operator: *operator,
                 analyzer: analyzer.clone(),
                 minimum_should_match: minimum_should_match.clone(),
+                lenient: *lenient,
             }
         }
         QueryNode::Bool {
@@ -43153,6 +43306,7 @@ fn strip_nested_path_in_query(q: &QueryNode, path: &str) -> QueryNode {
             lte,
             lt,
             boost,
+            lenient,
         } => QueryNode::Range {
             field: strip(field),
             gte: gte.clone(),
@@ -43160,6 +43314,7 @@ fn strip_nested_path_in_query(q: &QueryNode, path: &str) -> QueryNode {
             lte: lte.clone(),
             lt: lt.clone(),
             boost: *boost,
+            lenient: *lenient,
         },
         QueryNode::Prefix {
             field,
@@ -43195,6 +43350,7 @@ fn strip_nested_path_in_query(q: &QueryNode, path: &str) -> QueryNode {
             operator,
             analyzer,
             minimum_should_match,
+            lenient,
         } => QueryNode::Match {
             field: strip(field),
             query: query.clone(),
@@ -43202,6 +43358,7 @@ fn strip_nested_path_in_query(q: &QueryNode, path: &str) -> QueryNode {
             operator: *operator,
             analyzer: analyzer.clone(),
             minimum_should_match: minimum_should_match.clone(),
+            lenient: *lenient,
         },
         QueryNode::MatchPhrase {
             field,
@@ -43209,12 +43366,14 @@ fn strip_nested_path_in_query(q: &QueryNode, path: &str) -> QueryNode {
             slop,
             analyzer,
             boost,
+            lenient,
         } => QueryNode::MatchPhrase {
             field: strip(field),
             query: query.clone(),
             slop: *slop,
             analyzer: analyzer.clone(),
             boost: *boost,
+            lenient: *lenient,
         },
         QueryNode::MatchPhrasePrefix {
             field,
@@ -43253,6 +43412,7 @@ fn strip_nested_path_in_query(q: &QueryNode, path: &str) -> QueryNode {
             boost,
             slop,
             max_expansions,
+            lenient,
         } => QueryNode::MultiMatch {
             fields: fields.iter().map(|f| strip(f)).collect(),
             query: query.clone(),
@@ -43262,6 +43422,7 @@ fn strip_nested_path_in_query(q: &QueryNode, path: &str) -> QueryNode {
             boost: *boost,
             slop: *slop,
             max_expansions: *max_expansions,
+            lenient: *lenient,
         },
         QueryNode::GeoDistance {
             field,
@@ -50470,6 +50631,7 @@ fn query_node_to_fts_projected(
             boost,
             analyzer,
             minimum_should_match,
+            lenient: _,
         } => {
             // Per-clause boost (ES `{"match": {"f": {"query": …, "boost": N}}}`)
             // must reach the BM25 scorer — dropping it here made boosted and
@@ -50549,6 +50711,7 @@ fn query_node_to_fts_projected(
             // prefix and nothing needs the bound.
             max_expansions: _,
             analyzer,
+            lenient: _,
         } => {
             // phrase is POSITIONAL (issue #230): it lowers to one positional
             // clause per field, combined by dis_max — the
@@ -51084,6 +51247,7 @@ fn query_node_to_fts_projected(
             slop,
             analyzer,
             boost,
+            lenient: _,
         } => {
             // match_phrase on a KEYWORD field: the field is not tokenized, so
             // the query analyzes (keyword analyzer) to a single whole-value
@@ -52443,6 +52607,7 @@ fn scored_fast_plan(
                 lte,
                 lt,
                 boost,
+                lenient: _,
             } if fs.num.contains(field) && boost_ok(boost) => {
                 let (min, min_inc) = match (gte, gt) {
                     (Some(v), None) => (v.as_f64()?, true),
@@ -54479,6 +54644,7 @@ mod fts_projection_tests {
             analyzer: None,
             boost: None,
             minimum_should_match: None,
+            lenient: false,
         };
         let text_fields = vec!["body".to_string()];
         let fq = query_node_to_fts(&q, &text_fields, &kw(&["status"])).expect("projects");
@@ -54509,6 +54675,7 @@ mod fts_projection_tests {
             analyzer: None,
             boost: None,
             minimum_should_match: None,
+            lenient: false,
         };
         let fq = query_node_to_fts(&q, &["body".to_string()], &kw(&[])).expect("projects");
         match fq {
@@ -54532,6 +54699,7 @@ mod fts_projection_tests {
             analyzer: None,
             boost: None,
             minimum_should_match: None,
+            lenient: false,
         };
         let fq = query_node_to_fts(&q, &[], &kw(&["model"])).expect("projects");
         match fq {
@@ -54573,6 +54741,7 @@ mod fts_projection_tests {
             boost: None,
             slop: 0,
             max_expansions: 50,
+            lenient: false,
         };
         let fq = query_node_to_fts(&q, &[], &kw(&["model", "top_doc"])).expect("projects");
         match fq {
@@ -54603,6 +54772,7 @@ mod fts_projection_tests {
             boost: None,
             slop: 0,
             max_expansions: 50,
+            lenient: false,
         };
         let fq = query_node_to_fts(&q, &["title".to_string()], &kw(&["model"])).expect("projects");
         match fq {
@@ -54655,6 +54825,7 @@ mod fts_projection_tests {
             boost: None,
             slop: 0,
             max_expansions: 50,
+            lenient: false,
         }
     }
 
@@ -54768,6 +54939,7 @@ mod fts_projection_tests {
             boost: None,
             slop: 0,
             max_expansions: 50,
+            lenient: false,
         };
         let fq = query_node_to_fts(&q, &["body".to_string(), "title".to_string()], &kw(&[]))
             .expect("projects");
@@ -54803,6 +54975,7 @@ mod fts_projection_tests {
             boost: None,
             slop: 0,
             max_expansions: 50,
+            lenient: false,
         };
         assert!(
             query_node_to_fts(&q, &["body".to_string(), "title".to_string()], &kw(&[]),).is_none()
@@ -54824,6 +54997,7 @@ mod fts_projection_tests {
             boost: None,
             slop: 2,
             max_expansions: 50,
+            lenient: false,
         };
         let text = vec!["body".to_string(), "title".to_string()];
         match query_node_to_fts(&q, &text, &kw(&[])).expect("phrase projects") {
@@ -54861,6 +55035,7 @@ mod fts_projection_tests {
             boost: None,
             slop: 0,
             max_expansions: 7,
+            lenient: false,
         };
         assert!(
             query_node_to_fts(&q, &text, &kw(&[])).is_none(),
@@ -54887,6 +55062,7 @@ mod fts_projection_tests {
             boost: None,
             slop: 0,
             max_expansions: 50,
+            lenient: false,
         };
         assert!(
             query_node_to_fts(&keyword_field, &text, &kw(&["tags"])).is_none(),
@@ -54902,6 +55078,7 @@ mod fts_projection_tests {
             boost: None,
             slop: 0,
             max_expansions: 50,
+            lenient: false,
         };
         assert!(
             query_node_to_fts(&dotted, &text, &kw(&[])).is_none(),
@@ -54921,6 +55098,7 @@ mod fts_projection_tests {
             slop: 0,
             analyzer: None,
             boost: None,
+            lenient: false,
         };
         let fq = query_node_to_fts(&q, &[], &kw(&["top_doc"])).expect("keyword phrase projects");
         match fq {
@@ -54945,6 +55123,7 @@ mod fts_projection_tests {
             slop: 0,
             analyzer: None,
             boost: None,
+            lenient: false,
         };
         let fq =
             query_node_to_fts(&q, &["body".to_string()], &kw(&[])).expect("text phrase projects");
@@ -54969,6 +55148,7 @@ mod fts_projection_tests {
             slop: 2,
             analyzer: None,
             boost: None,
+            lenient: false,
         };
         assert!(
             query_node_to_fts(&q, &["body".to_string()], &kw(&[])).is_none(),
@@ -55079,6 +55259,7 @@ mod fts_projection_tests {
                     analyzer: None,
                     boost: None,
                     minimum_should_match: None,
+                    lenient: false,
                 },
                 QueryNode::Match {
                     field: "status".into(),
@@ -55087,6 +55268,7 @@ mod fts_projection_tests {
                     analyzer: None,
                     boost: None,
                     minimum_should_match: None,
+                    lenient: false,
                 },
             ],
             should: vec![],
@@ -55799,6 +55981,7 @@ mod lexical_passage_tests {
             boost: None,
             slop: 0,
             max_expansions: 50,
+            lenient: false,
         };
         let hit = Hit {
             id: "doc-1".into(),
@@ -55857,6 +56040,7 @@ mod lexical_passage_tests {
             boost: None,
             slop: 0,
             max_expansions: 50,
+            lenient: false,
         };
         let hit = Hit {
             id: "doc-1".into(),
@@ -55894,6 +56078,7 @@ mod lexical_passage_tests {
             analyzer: None,
             boost: None,
             minimum_should_match: None,
+            lenient: false,
         };
         let hit = Hit {
             id: "doc-1".into(),
@@ -55937,6 +56122,7 @@ mod lexical_passage_tests {
             analyzer: None,
             boost: None,
             minimum_should_match: None,
+            lenient: false,
         };
         let plain_hit = Hit {
             id: "doc-1".into(),
@@ -55991,6 +56177,7 @@ mod lexical_passage_tests {
             analyzer: None,
             boost: None,
             minimum_should_match: None,
+            lenient: false,
         };
         let semantic = PassageMatch {
             field: "body".into(),
@@ -57144,6 +57331,7 @@ mod write_publication_integration_tests {
                 analyzer: None,
                 boost: None,
                 minimum_should_match: None,
+                lenient: false,
             },
             ..SearchRequest::default()
         };
@@ -57214,6 +57402,7 @@ mod write_publication_integration_tests {
                 analyzer: None,
                 boost: None,
                 minimum_should_match: None,
+                lenient: false,
             },
             ..SearchRequest::default()
         };
@@ -57266,6 +57455,7 @@ mod write_publication_integration_tests {
                 analyzer: None,
                 boost: None,
                 minimum_should_match: None,
+                lenient: false,
             },
             ..SearchRequest::default()
         };
@@ -57321,6 +57511,7 @@ mod write_publication_integration_tests {
                 analyzer: None,
                 boost: None,
                 minimum_should_match: None,
+                lenient: false,
             },
             ..SearchRequest::default()
         };
@@ -57332,6 +57523,7 @@ mod write_publication_integration_tests {
                 analyzer: None,
                 boost: None,
                 minimum_should_match: None,
+                lenient: false,
             },
             ..SearchRequest::default()
         };
@@ -57639,6 +57831,7 @@ mod unwrap_single_clause_643_wrapper_tests {
             analyzer: None,
             boost: None,
             minimum_should_match: None,
+            lenient: false,
         }
     }
 
@@ -58676,6 +58869,7 @@ mod exact_scan_hydration_tests {
             lte: None,
             lt: Some(Value::from(800)),
             boost: None,
+            lenient: false,
         };
         vec![
             ("none", None),
@@ -58716,6 +58910,7 @@ mod exact_scan_hydration_tests {
                     analyzer: None,
                     boost: None,
                     minimum_should_match: None,
+                    lenient: false,
                 }),
             ),
         ]
@@ -59240,6 +59435,7 @@ mod exact_scan_hydration_tests {
                 lte: None,
                 lt: Some(Value::from(800)),
                 boost: None,
+                lenient: false,
             },
             QueryNode::Prefix {
                 field: "tag".into(),
